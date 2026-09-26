@@ -1,5 +1,5 @@
 import { fetchPage, parseListPage, parseSeriesPage, SITE } from "./scraper.js";
-import { fetchSrt } from "./kisskh.js";
+import { fetchSrt, makeKkey } from "./kisskh.js";
 
 const TTL = 300;
 
@@ -13,7 +13,7 @@ const STREAM_NS = "https://kdrama.stream/";
 
 // Set to your self-hosted kisskh proxy (see proxy.js) URL, e.g. the cloudflared tunnel.
 // Leave empty to disable kisskh list discovery (the /kisskh/srt endpoint still works with a src).
-const KISSKH_PROXY = "";
+const KISSKH_PROXY = "https://proxy.jshmlnd.space";
 
 // ponytail: hardcoded provider whitelist from dramavibe player; add hosts if the source player URL changes.
 const PROVIDERS = ["cdn.dramav2.xyz", "cdn.drama3.click", "storage.dramavibe.cfd"];
@@ -55,6 +55,34 @@ async function streamUrl(id) {
   return body && typeof body.url === "string" ? body.url : null;
 }
 
+// ponytail: kisskh's Sub API rate-limits hard, so when the list is empty we
+// synthesize the English src from sub.cdnvideo11's naming pattern
+// (<KebabTitle>.Ep<N>_eng.srt[.txt]); ceiling: works where the CDN uses that
+// pattern, other dramas still need a live kisskh list.
+function synthSrtUrl(drama, epno) {
+  const cap = drama.replace(/-\d{4}$/, "").split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("-");
+  return `https://sub.cdnvideo11.shop/${cap}.Ep${epno}_eng.srt.txt`;
+}
+
+async function kisskhList(kisskhId, origin, drama, epno) {
+  if (drama && !/^[a-z0-9-]+$/.test(drama)) drama = undefined;
+  epno = ((epno || "").match(/\d+/) || [])[0];
+  const r = await fetch(`${KISSKH_PROXY}/api/Sub/${kisskhId}${drama ? `?drama=${encodeURIComponent(drama)}` : ""}`);
+  const list = r.ok ? await r.json().catch(() => []) : [];
+  if (Array.isArray(list) && list.length) {
+    return list.map((s) => ({
+      label: s.label,
+      language: s.land,
+      default: !!s.default,
+      url: s.src ? `${origin}/kisskh/srt?src=${encodeURIComponent(s.src)}` : null,
+    }));
+  }
+  if (drama && epno) {
+    return [{ label: "English", language: "en", default: true, url: `${origin}/kisskh/srt?src=${encodeURIComponent(synthSrtUrl(drama, epno))}` }];
+  }
+  return [];
+}
+
 async function subtitles(req, id) {
   const source = await streamUrl(id);
   if (!source) return json({ error: "not captured yet" }, 404);
@@ -70,7 +98,13 @@ async function subtitles(req, id) {
   try {
     if (r.ok) list = await r.json();
   } catch {}
-  return json({ subtitles: (Array.isArray(list) ? list : []).map((s) => ({ ...s, url: proxyUrl(id, s.url, new URL(req.url).origin) })) });
+  let subs = (Array.isArray(list) ? list : []).map((s) => ({ ...s, url: proxyUrl(id, s.url, new URL(req.url).origin) }));
+  // ponytail: empty Dramavibe list falls back to kisskh by id; drop if ids ever diverge.
+  if (!subs.length && /^\d+$/.test(id) && KISSKH_PROXY) {
+    const sp = new URL(req.url).searchParams;
+    subs = await kisskhList(id, new URL(req.url).origin, sp.get("drama") || undefined, sp.get("epno") || undefined);
+  }
+  return json({ subtitles: subs });
 }
 
 function proxyUrl(id, target, origin) {
@@ -160,7 +194,9 @@ export default {
             "/stream/:id/manifest": "GET rewritten m3u8 manifest",
             "/stream/:id/subtitles": "GET subtitle track list (url points at the proxy)",
             "/stream/:id/proxy?url=...": "GET proxied HLS resource",
-            "/kisskh/:episodeId/subtitles": "GET kisskh subtitle track list (via KISSKH_PROXY)",
+            "/kisskh/:episodeId/subtitles": "GET kisskh subtitle track list (via KISSKH_PROXY; ?drama=&epno= enables a CDN-pattern fallback)",
+            "/kisskh/:slug/:number/subtitles": "GET synthesized English track by drama slug + episode number (bypasses kisskh Sub API)",
+            "/kisskh/:episodeId/kkey": "GET kisskh kkey for client-side list fetch",
             "/kisskh/srt?src=...": "GET decrypted English kisskh SRT",
           },
         });
@@ -175,18 +211,43 @@ export default {
       if (p === "/kisskh/srt" && req.method === "GET") {
         const src = new URL(req.url).searchParams.get("src");
         if (!src) return json({ error: "missing src" }, 400);
-        const text = await fetchSrt(src);
+        // ponytail: cdnvideo11 names live as both ".srt" and ".srt.txt"; retry the sibling.
+        let text;
+        try {
+          text = await fetchSrt(src);
+        } catch (e) {
+          if (!/\.srt(\.txt)?(\?.*)?$/.test(src)) throw e;
+          let alt;
+          if (/\.srt\.txt(\?.*)?$/.test(src)) alt = src.replace(/\.srt\.txt(?=$|\?)/, ".srt");
+          else alt = src.replace(/\.srt(?=$|\?)/, ".srt.txt");
+          if (new URL(alt).hostname !== new URL(src).hostname) throw e;
+          text = await fetchSrt(alt);
+        }
         return new Response(text, { headers: { ...CORS, "content-type": "text/plain; charset=utf-8", "content-disposition": "inline; filename=subtitle.srt" } });
+      }
+      const kisskhKey = p.match(/^\/kisskh\/(\d+)\/kkey\/?$/);
+      if (kisskhKey && req.method === "GET") {
+        const drama = new URL(req.url).searchParams.get("drama") || undefined;
+        if (drama && !/^[a-z0-9-]+$/.test(drama)) return json({ error: "bad drama" }, 400);
+        return json({ episode: kisskhKey[1], kkey: makeKkey(kisskhKey[1], drama) });
       }
       const kisskhSub = p.match(/^\/kisskh\/(\d+)\/subtitles\/?$/);
       if (kisskhSub && req.method === "GET") {
         if (!KISSKH_PROXY) return json({ error: "KISSKH_PROXY not configured" }, 503);
-        const r = await fetch(`${KISSKH_PROXY}/api/Sub/${kisskhSub[1]}`);
-        if (!r.ok) return json({ error: `proxy ${r.status}` }, 502);
-        const list = await r.json();
         const origin = new URL(req.url).origin;
+        const sp = new URL(req.url).searchParams;
+        const list = await kisskhList(kisskhSub[1], origin, sp.get("drama") || undefined, sp.get("epno") || undefined);
+        return json({ subtitles: list });
+      }
+      // Synthesized list without a kisskh episode id (kisskh Sub API is
+      // rate-limit hostile): /kisskh/:slug/:number/subtitles -> English track
+      // from sub.cdnvideo11's <Kebab-Title>.Ep<N>_eng.srt[.txt] pattern.
+      const watchSub = p.match(/^\/kisskh\/([a-z0-9-]+)\/(\d+)\/subtitles\/?$/);
+      if (watchSub && req.method === "GET") {
+        const origin = new URL(req.url).origin;
+        const src = synthSrtUrl(watchSub[1], watchSub[2]);
         return json({
-          subtitles: list.map((s) => ({ ...s, url: s.src ? `${origin}/kisskh/srt?src=${encodeURIComponent(s.src)}` : null })),
+          subtitles: [{ label: "English", language: "en", default: true, url: `${origin}/kisskh/srt?src=${encodeURIComponent(src)}` }],
         });
       }
       if (p === "/drama" || p === "/drama/") {

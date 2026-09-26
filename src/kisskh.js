@@ -17,17 +17,24 @@ const SRT_IV = new TextEncoder().encode("6852612370185273");
 const SUB_HOSTS = ["sub.cdnvideo11.shop", "auto.cdnvideo11.shop"];
 
 function javaHash(s) {
+  // kisskh computes this as an untruncated JS number (no |0); truncating
+  // mismatches most episode fingerprints and kisskh 403s them.
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h << 5) - h + s.charCodeAt(i);
-  return h | 0;
+  return h;
 }
 
 function toHex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
 }
 
-export function makeKkey(episodeId) {
-  const parts = ["", episodeId, null, "mg3c3b04ba", APP_VER, SUB_GUID, PLATFORM_VER, "kisskh", "kisskh", "kisskh", "kisskh", "kisskh", "kisskh", "00", ""];
+export function makeKkey(episodeId, dramaSlug = "marry-my-husband") {
+  // Current fingerprint (decoded from common.js cryptoService.key, byte-match
+  // validated live): ''|hash|epId|''|salt|''|''|''|dramaPageUrl|lowercaseUa|''|codeName|appName|platform|00|''
+  // The drama page URL is part of the client fingerprint (document.URL).
+  const dramaUrl = `${SITE}/drama-detail/${dramaSlug}`.slice(0, 48);
+  const ua = UA.toLowerCase();
+  const parts = ["", episodeId, null, "mg3c3b04ba", null, null, null, dramaUrl, ua.slice(0, 48), null, "Mozilla", "Netscape", "Win32", "00", ""];
   const hash = javaHash(parts.join("|"));
   parts.splice(1, 0, hash);
   const s = parts.join("|");

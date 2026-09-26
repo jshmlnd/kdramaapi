@@ -55,7 +55,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   try {
-    const kkey = makeKkey(m[1]);
+    const drama = url.searchParams.get("drama") || undefined;
+    const kkey = makeKkey(m[1], drama);
     const r = await kisskhGet(`/api/Sub/${m[1]}?kkey=${kkey}`);
     if (r.status !== 200) throw new Error(`kisskh ${r.status}`);
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
