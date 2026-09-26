@@ -198,6 +198,7 @@ export default {
             "/kisskh/:slug/:number/subtitles": "GET synthesized English track by drama slug + episode number (bypasses kisskh Sub API)",
             "/kisskh/:episodeId/kkey": "GET kisskh kkey for client-side list fetch",
             "/kisskh/srt?src=...": "GET decrypted English kisskh SRT",
+            "/resolver?src=...": "GET allowlisted passthrough to api.dramacool.rest (for Vercel egress)",
           },
         });
       }
@@ -248,6 +249,31 @@ export default {
         const src = synthSrtUrl(watchSub[1], watchSub[2]);
         return json({
           subtitles: [{ label: "English", language: "en", default: true, url: `${origin}/kisskh/srt?src=${encodeURIComponent(src)}` }],
+        });
+      }
+      // Vercel egress is blocked by the resolver (dramacool); allowlisted GET
+      // passthrough so the site can route through Cloudflare instead.
+      if (p === "/resolver" && req.method === "GET") {
+        const src = new URL(req.url).searchParams.get("src");
+        let target;
+        try {
+          target = new URL(src);
+        } catch {
+          return json({ error: "bad src" }, 400);
+        }
+        if (target.protocol !== "https:" || target.hostname !== "api.dramacool.rest") return json({ error: "src not allowed" }, 403);
+        // Hardcoded: the resolver 403s when callers' headers pass through (Vercel
+        // mutates them on the way); this exact set is verified working.
+        const headers = new Headers({
+          "user-agent": "Mozilla/5.0 (compatible; MeiDrama/1.0)",
+          "x-access-control": "web",
+          origin: "https://kisskh.casa",
+          referer: "https://kisskh.casa/",
+        });
+        const r = await fetch(target, { headers });
+        return new Response(r.body, {
+          status: r.status,
+          headers: { ...CORS, "content-type": r.headers.get("content-type") || "application/json", "cache-control": "no-store" },
         });
       }
       if (p === "/drama" || p === "/drama/") {
